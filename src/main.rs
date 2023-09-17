@@ -119,7 +119,7 @@ impl App {
         create_render_pass(&instance, &device, &mut data)?;
         create_pipeline(&device, &mut data)?;
         create_framebuffers(&device, &mut data)?;
-        create_command_pool(&instance, &device, &mut data)?;
+        create_command_pools(&instance, &device, &mut data)?;
         create_vertex_buffer(&instance, &device, &mut data)?;
         create_command_buffers(&device, &mut data)?;
         create_sync_objects(&device, &mut data)?;
@@ -219,7 +219,7 @@ impl App {
         self.data.framebuffers
             .iter()
             .for_each(|f| self.device.destroy_framebuffer(*f, None));
-        self.device.free_command_buffers(self.data.command_pool, &self.data.command_buffers);
+        self.device.free_command_buffers(self.data.graphics_command_pool, &self.data.command_buffers);
         self.device.destroy_pipeline(self.data.pipeline, None);
         self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
         self.device.destroy_render_pass(self.data.render_pass, None);
@@ -245,7 +245,8 @@ impl App {
         self.data.image_available_semaphores
             .iter()
             .for_each(|s| self.device.destroy_semaphore(*s, None));
-        self.device.destroy_command_pool(self.data.command_pool, None);
+        self.device.destroy_command_pool(self.data.transfer_command_pool, None);
+        self.device.destroy_command_pool(self.data.graphics_command_pool, None);
         self.device.destroy_device(None);
 
         if VALIDATION_ENABLED {
@@ -267,6 +268,7 @@ struct AppData {
     physical_device: vk::PhysicalDevice,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
+    transfer_queue: vk::Queue,
     swapchain_format: vk::Format,
     swapchain_extent: vk::Extent2D,
     swapchain: vk::SwapchainKHR,
@@ -276,7 +278,8 @@ struct AppData {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
-    command_pool: vk::CommandPool,
+    graphics_command_pool: vk::CommandPool,
+    transfer_command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     image_available_semaphores: Vec<vk::Semaphore>,
     render_finished_semaphores: Vec<vk::Semaphore>,
@@ -457,6 +460,7 @@ unsafe fn create_logical_device(
     let mut unique_indices = HashSet::new();
     unique_indices.insert(indices.graphics);
     unique_indices.insert(indices.present);
+    unique_indices.insert(indices.transfer);
 
     let queue_priorities = &[1.0];
     let queue_infos = unique_indices
@@ -496,6 +500,7 @@ unsafe fn create_logical_device(
 
     data.graphics_queue = device.get_device_queue(indices.graphics, 0);
     data.present_queue = device.get_device_queue(indices.present, 0);
+    data.transfer_queue = device.get_device_queue(indices.transfer, 0);
 
     Ok(device)
 }
@@ -856,7 +861,7 @@ unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()>
 
 
 
-unsafe fn create_command_pool(
+unsafe fn create_command_pools(
     instance: &Instance,
     device: &Device,
     data: &mut AppData,
@@ -867,7 +872,13 @@ unsafe fn create_command_pool(
         .flags(vk::CommandPoolCreateFlags::empty()) // Optional.
         .queue_family_index(indices.graphics);
 
-    data.command_pool = device.create_command_pool(&info, None)?;
+    data.graphics_command_pool = device.create_command_pool(&info, None)?;
+
+    let info = vk::CommandPoolCreateInfo::builder()
+        .flags(vk::CommandPoolCreateFlags::empty()) // Optional.
+        .queue_family_index(indices.transfer);
+
+    data.transfer_command_pool = device.create_command_pool(&info, None)?;
 
     Ok(())
 }
@@ -876,7 +887,7 @@ unsafe fn create_command_pool(
 
 unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<()> {
     let allocate_info = vk::CommandBufferAllocateInfo::builder()
-        .command_pool(data.command_pool)
+        .command_pool(data.graphics_command_pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(data.framebuffers.len() as u32);
 
@@ -956,38 +967,44 @@ unsafe fn create_vertex_buffer(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> {
-    let buffer_info = vk::BufferCreateInfo::builder()
-        .size((size_of::<Vertex>() * VERTICES.len()) as u64)
-        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .flags(vk::BufferCreateFlags::empty()); // Optional.
-
-    data.vertex_buffer = device.create_buffer(&buffer_info, None)?;
-
-    let requirements = device.get_buffer_memory_requirements(data.vertex_buffer);
-
-    let memory_info = vk::MemoryAllocateInfo::builder()
-        .allocation_size(requirements.size)
-        .memory_type_index(get_memory_type_index(
-            instance,
-            data,
-            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
-            requirements,
-        )?);
-
-    data.vertex_buffer_memory = device.allocate_memory(&memory_info, None)?;
-
-    device.bind_buffer_memory(data.vertex_buffer, data.vertex_buffer_memory, 0)?;
+    let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+    
+    let (staging_buffer, staging_buffer_memory) = create_buffer(
+        instance,
+        device,
+        data,
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE
+    )?;
 
     let memory = device.map_memory(
-        data.vertex_buffer_memory,
+        staging_buffer_memory,
         0,
-        buffer_info.size,
+        size,
         vk::MemoryMapFlags::empty(),
     )?;
     
     memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
-    device.unmap_memory(data.vertex_buffer_memory);
+    
+    device.unmap_memory(staging_buffer_memory);
+
+    let (vertex_buffer, vertex_buffer_memory) = create_buffer(
+        instance,
+        device,
+        data,
+        size,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL
+    )?;
+
+    copy_buffer(device, data, staging_buffer, vertex_buffer, size)?;
+
+    data.vertex_buffer = vertex_buffer;
+    data.vertex_buffer_memory = vertex_buffer_memory;
+
+    device.destroy_buffer(staging_buffer, None);
+    device.free_memory(staging_buffer_memory, None);
 
     Ok(())
 }
@@ -1011,6 +1028,83 @@ unsafe fn get_memory_type_index(
 
 
 
+unsafe fn create_buffer(
+    instance: &Instance,
+    device: &Device,
+    data: &AppData,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+    properties: vk::MemoryPropertyFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
+    let queue_family_indices = [indices.graphics, indices.transfer];
+
+    let buffer_info = vk::BufferCreateInfo::builder()
+        .size(size)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::CONCURRENT)
+        .queue_family_indices(&queue_family_indices);
+
+    let buffer = device.create_buffer(&buffer_info, None)?;
+
+    let requirements = device.get_buffer_memory_requirements(buffer);
+
+    let memory_info = vk::MemoryAllocateInfo::builder()
+        .allocation_size(requirements.size)
+        .memory_type_index(get_memory_type_index(
+            instance,
+            data,
+            properties,
+            requirements,
+        )?);
+
+    let buffer_memory = device.allocate_memory(&memory_info, None)?;
+
+    device.bind_buffer_memory(buffer, buffer_memory, 0)?;
+
+    Ok((buffer, buffer_memory))
+}
+
+
+
+unsafe fn copy_buffer(
+    device: &Device,
+    data: &AppData,
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    size: vk::DeviceSize,
+) -> Result<()> {
+    let info = vk::CommandBufferAllocateInfo::builder()
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_pool(data.transfer_command_pool)
+        .command_buffer_count(1);
+
+    let command_buffer = device.allocate_command_buffers(&info)?[0];
+
+    let info = vk::CommandBufferBeginInfo::builder()
+        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+    device.begin_command_buffer(command_buffer, &info)?;
+
+    let regions = vk::BufferCopy::builder().size(size);
+    device.cmd_copy_buffer(command_buffer, source, destination, &[regions]);
+
+    device.end_command_buffer(command_buffer)?;
+
+    let command_buffers = &[command_buffer];
+    let info = vk::SubmitInfo::builder()
+        .command_buffers(command_buffers);
+
+    device.queue_submit(data.transfer_queue, &[info], vk::Fence::null())?;
+    device.queue_wait_idle(data.transfer_queue)?;
+
+    device.free_command_buffers(data.transfer_command_pool, &[command_buffer]);
+
+    Ok(())
+}
+
+
+
 #[derive(Debug, Error)]
 #[error("Missing {0}.")]
 pub struct SuitabilityError(pub &'static str);
@@ -1021,6 +1115,7 @@ pub struct SuitabilityError(pub &'static str);
 struct QueueFamilyIndices {
     graphics: u32,
     present: u32,
+    transfer: u32,
 }
 
 impl QueueFamilyIndices {
@@ -1037,6 +1132,14 @@ impl QueueFamilyIndices {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
             .map(|i| i as u32);
 
+        let transfer = properties
+            .iter()
+            .position(|p| {
+                p.queue_flags.contains(vk::QueueFlags::TRANSFER) &&
+                !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            })
+            .map(|i| i as u32);
+
         let mut present = None;
         for (index, properties) in properties.iter().enumerate() {
             if instance.get_physical_device_surface_support_khr(
@@ -1049,8 +1152,8 @@ impl QueueFamilyIndices {
             }
         }
 
-        if let (Some(graphics), Some(present)) = (graphics, present) {
-            Ok(Self { graphics, present })
+        if let (Some(graphics), Some(present), Some(transfer)) = (graphics, present, transfer) {
+            Ok(Self { graphics, present, transfer })
         } else {
             Err(anyhow!(SuitabilityError("Missing required queue families.")))
         }
