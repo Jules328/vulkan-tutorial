@@ -5,9 +5,11 @@
     clippy::unnecessary_wraps
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::ffi::CStr;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::BufReader;
 use std::mem::size_of;
 use std::os::raw::c_void;
 use std::ptr::copy_nonoverlapping as memcpy;
@@ -140,6 +142,7 @@ impl App {
         create_texture_image(&instance, &device, &mut data)?;
         create_texture_image_view(&device, &mut data)?;
         create_texture_sampler(&device, &mut data)?;
+        load_model(&mut data)?;
         create_draw_buffers(&instance, &device, &mut data)?;
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
@@ -234,9 +237,9 @@ impl App {
         );
 
         let view = Mat4::look_at_rh(
-            point3(1.0, 2.0, -2.0),
+            point3(2.0, 2.0, 2.0),
             point3(0.0, 0.0, 0.0),
-            vec3(0.0, -1.0, 0.0),
+            vec3(0.0, 0.0, 1.0),
         );
 
         // Convert's from cgmath's OpenGL perspective matrix to Vulkan
@@ -380,6 +383,8 @@ struct AppData {
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
     images_in_flight: Vec<vk::Fence>,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
@@ -803,7 +808,7 @@ unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
         .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::CLOCKWISE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .depth_bias_enable(false);
 
     let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
@@ -1052,7 +1057,7 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
             *command_buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
 
         device.cmd_bind_vertex_buffers(*command_buffer, 0, &[data.vertex_buffer], &[0]);
-        device.cmd_bind_index_buffer(*command_buffer, data.index_buffer, 0, vk::IndexType::UINT16);
+        device.cmd_bind_index_buffer(*command_buffer, data.index_buffer, 0, vk::IndexType::UINT32);
 
         device.cmd_bind_descriptor_sets(
             *command_buffer,
@@ -1063,7 +1068,7 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
             &[],
         );
 
-        device.cmd_draw_indexed(*command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+        device.cmd_draw_indexed(*command_buffer, data.indices.len() as u32, 1, 0, 0, 0);
 
         device.cmd_end_render_pass(*command_buffer);
 
@@ -1161,7 +1166,7 @@ unsafe fn create_draw_buffer<T>(
     instance: &Instance,
     device: &Device,
     data: &AppData,
-    contents: &[T],
+    contents: &Vec<T>,
     usage: vk::BufferUsageFlags,
 ) -> Result<(vk::Buffer, vk::DeviceMemory)> {
     let size = (size_of::<T>() * contents.len()) as u64;
@@ -1181,7 +1186,7 @@ unsafe fn create_draw_buffer<T>(
         size,
         vk::MemoryMapFlags::empty(),
     )?;
-    
+
     memcpy(contents.as_ptr(), memory.cast(), contents.len());
     
     device.unmap_memory(staging_buffer_memory);
@@ -1247,18 +1252,18 @@ unsafe fn create_draw_buffers(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> {
-    (data.vertex_buffer, data.vertex_buffer_memory) = create_draw_buffer::<Vertex>(
+    (data.vertex_buffer, data.vertex_buffer_memory) = create_draw_buffer(
         instance,
         device,
         data,
-        VERTICES,
+        &data.vertices,
         vk::BufferUsageFlags::VERTEX_BUFFER)?;
         
-    (data.index_buffer, data.index_buffer_memory) = create_draw_buffer::<u16>(
+    (data.index_buffer, data.index_buffer_memory) = create_draw_buffer(
         instance,
         device,
         data,
-        INDICES,
+        &data.indices,
         vk::BufferUsageFlags::INDEX_BUFFER)?;
 
     Ok(())
@@ -1392,7 +1397,7 @@ unsafe fn create_texture_image(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> {
-    let image = File::open("resources/texture.png")?;
+    let image = File::open("resources/viking_room.png")?;
 
     let decoder = png::Decoder::new(image);
     let mut reader = decoder.read_info()?;
@@ -1402,6 +1407,10 @@ unsafe fn create_texture_image(
 
     let size = reader.info().raw_bytes() as u64;
     let (width, height) = reader.info().size();
+
+    if width != 1024 || height != 1024 || reader.info().color_type != png::ColorType::Rgba {
+        panic!("Invalid texture image.");
+    }
 
     let (staging_buffer, staging_buffer_memory) = create_buffer(
         instance,
@@ -1834,6 +1843,51 @@ unsafe fn get_depth_format(instance: &Instance, data: &AppData) -> Result<vk::Fo
 
 
 
+fn load_model(data: &mut AppData) -> Result<()> {
+    let mut reader = BufReader::new(File::open("resources/viking_room.obj")?);
+
+    let (models, _) = tobj::load_obj_buf(
+        &mut reader,
+        &tobj::LoadOptions { triangulate: true, ..Default::default() },
+        |_| Ok(Default::default()),
+    )?;
+
+    let mut unique_vertices = HashMap::new();
+
+    for model in &models {
+        for index in &model.mesh.indices {
+            let pos_offset = (3 * index) as usize;
+            let tex_coord_offset = (2 * index) as usize;
+
+            let vertex = Vertex {
+                pos: vec3(
+                    model.mesh.positions[pos_offset],
+                    model.mesh.positions[pos_offset + 1],
+                    model.mesh.positions[pos_offset + 2],
+                ),
+                color: vec4(1.0, 1.0, 1.0, 0.0),
+                tex_coord: vec2(
+                    model.mesh.texcoords[tex_coord_offset],
+                    1.0 - model.mesh.texcoords[tex_coord_offset + 1],
+                ),
+            };
+
+            if let Some(index) = unique_vertices.get(&vertex) {
+                data.indices.push(*index as u32);
+            } else {
+                let index = data.vertices.len();
+                unique_vertices.insert(vertex, index);
+                data.vertices.push(vertex);
+                data.indices.push(index as u32);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
+
 #[derive(Debug, Error)]
 #[error("Missing {0}.")]
 pub struct SuitabilityError(pub &'static str);
@@ -1967,6 +2021,32 @@ impl Vertex {
         [pos, color, tex_coord]
     }
 }
+
+impl PartialEq for Vertex {
+    fn eq(&self, other: &Self) -> bool {
+        self.pos == other.pos
+            && self.color == other.color
+            && self.tex_coord == other.tex_coord
+    }
+}
+
+impl Eq for Vertex {}
+
+impl Hash for Vertex {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.pos[0].to_bits().hash(state);
+        self.pos[1].to_bits().hash(state);
+        self.pos[2].to_bits().hash(state);
+        self.color[0].to_bits().hash(state);
+        self.color[1].to_bits().hash(state);
+        self.color[2].to_bits().hash(state);
+        self.color[3].to_bits().hash(state);
+        self.tex_coord[0].to_bits().hash(state);
+        self.tex_coord[1].to_bits().hash(state);
+    }
+}
+
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
