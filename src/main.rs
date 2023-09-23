@@ -1281,13 +1281,19 @@ unsafe fn create_descriptor_set_layout(
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::VERTEX);
 
-    let sampler_binding = vk::DescriptorSetLayoutBinding::builder()
+    let image_binding = vk::DescriptorSetLayoutBinding::builder()
         .binding(1)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT);
 
-    let bindings = &[ubo_binding, sampler_binding];
+    let sampler_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(2)
+        .descriptor_type(vk::DescriptorType::SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+    let bindings = &[ubo_binding, image_binding, sampler_binding];
     let info = vk::DescriptorSetLayoutCreateInfo::builder()
         .bindings(bindings);
     
@@ -1371,18 +1377,31 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
         let info = vk::DescriptorImageInfo::builder()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image_view(data.texture_image_view)
-            .sampler(data.texture_sampler);
+            .sampler(vk::Sampler::null());
         
         let image_info = &[info];
+        let image_write = vk::WriteDescriptorSet::builder()
+        .dst_set(data.descriptor_sets[i])
+        .dst_binding(1)
+        .dst_array_element(0)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(image_info);
+
+        let info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::UNDEFINED)
+            .image_view(vk::ImageView::null())
+            .sampler(data.texture_sampler);
+    
+        let sampler_info = &[info];
         let sampler_write = vk::WriteDescriptorSet::builder()
             .dst_set(data.descriptor_sets[i])
-            .dst_binding(1)
+            .dst_binding(2)
             .dst_array_element(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(image_info);
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(sampler_info);
         
         device.update_descriptor_sets(
-            &[ubo_write, sampler_write],
+            &[ubo_write, image_write, sampler_write],
             &[] as &[vk::CopyDescriptorSet],
         );
     }
